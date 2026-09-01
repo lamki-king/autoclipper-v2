@@ -1,15 +1,14 @@
-import importlib.util, json, os, shutil, uuid
+import importlib.util, os, shutil, uuid
 from pathlib import Path
 from typing import Optional
 
 import boto3
 from botocore.exceptions import ClientError
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
-# Load the proven AI/FFmpeg engine without loading its FastAPI routes.
 _spec = importlib.util.spec_from_file_location('autoclipper_legacy', Path(__file__).with_name('main.py'))
 legacy = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(legacy)
@@ -22,16 +21,15 @@ R2_ACCESS_KEY_ID = os.getenv('R2_ACCESS_KEY_ID', '')
 R2_SECRET_ACCESS_KEY = os.getenv('R2_SECRET_ACCESS_KEY', '')
 R2_BUCKET = os.getenv('R2_BUCKET', '')
 R2_ENDPOINT = os.getenv('R2_ENDPOINT') or (f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com' if R2_ACCOUNT_ID else '')
-R2_REGION = 'auto'
 
 s3 = None
 if all([R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_ENDPOINT]):
-    s3 = boto3.client('s3', endpoint_url=R2_ENDPOINT, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, region_name=R2_REGION)
+    s3 = boto3.client('s3', endpoint_url=R2_ENDPOINT, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, region_name='auto')
 
 JOBS = legacy.JOBS
 legacy.WORK_DIR = WORK_DIR
 legacy.JOBS = JOBS
-app = FastAPI(title='AutoClipper V5', version='5.0.0')
+app = FastAPI(title='AutoClipper V5', version='5.1.0')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 
 class UploadInit(BaseModel):
@@ -48,11 +46,9 @@ class UploadComplete(BaseModel):
     max_clips: int = 5
     instruction: str = ''
 
-
 def require_storage():
     if not s3:
         raise HTTPException(503, 'Persistent upload storage is not configured. Set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_BUCKET in Render.')
-
 
 def check_auth(x_api_key: Optional[str]):
     key = os.getenv('AUTOCLIPPER_API_KEY', '')
@@ -70,7 +66,7 @@ def root_head():
 
 @app.get('/health')
 def health():
-    return {'status':'healthy','version':'5.0.0','openai_configured':bool(os.getenv('OPENAI_API_KEY')),'storage':'r2' if s3 else 'not_configured','part_size':PART_SIZE,'max_upload_mb':MAX_UPLOAD_MB,'encoder':legacy.VIDEO_ENCODER}
+    return {'status':'healthy','version':'5.1.0','openai_configured':bool(os.getenv('OPENAI_API_KEY')),'storage':'r2' if s3 else 'not_configured','part_size':PART_SIZE,'max_upload_mb':MAX_UPLOAD_MB,'encoder':legacy.VIDEO_ENCODER}
 
 @app.post('/upload/init')
 def upload_init(body: UploadInit):
@@ -82,34 +78,58 @@ def upload_init(body: UploadInit):
     key = f'uploads/{uuid.uuid4().hex}/{Path(body.filename).name}'
     try:
         created = s3.create_multipart_upload(Bucket=R2_BUCKET, Key=key, ContentType=body.content_type or 'video/mp4')
-        upload_id = created['UploadId']
-        total = (body.size + PART_SIZE - 1) // PART_SIZE
-        urls = []
-        for n in range(1, total + 1):
-            urls.append({'part_number': n, 'url': s3.generate_presigned_url('upload_part', Params={'Bucket':R2_BUCKET,'Key':key,'UploadId':upload_id,'PartNumber':n}, ExpiresIn=3600)})
-        return {'upload_id':upload_id,'key':key,'part_size':PART_SIZE,'parts':urls,'total_parts':total,'status':'initialized'}
+        return {'upload_id':created['UploadId'],'key':key,'part_size':PART_SIZE,'total_parts':(body.size + PART_SIZE - 1)//PART_SIZE,'status':'initialized'}
     except Exception as e:
         raise HTTPException(502, f'Could not initialize persistent upload: {e}')
+
+@app.put('/upload/part/{upload_id}/{part_number}')
+async def upload_part(upload_id: str, part_number: int, key: str, chunk: UploadFile = File(...)):
+    require_storage()
+    if part_number < 1 or part_number > 10000:
+        raise HTTPException(400, 'Invalid part number')
+    if not key.startswith('uploads/'):
+        raise HTTPException(400, 'Invalid upload key')
+    try:
+        # Stream the part directly to R2. Render never stores upload parts on local disk.
+        body = await chunk.read()
+        if not body or len(body) > PART_SIZE + 1024 * 1024:
+            raise HTTPException(413, 'Invalid chunk size')
+        result = s3.upload_part(Bucket=R2_BUCKET, Key=key, UploadId=upload_id, PartNumber=part_number, Body=body)
+        return {'PartNumber':part_number,'ETag':result['ETag']}
+    except HTTPException:
+        raise
+    except ClientError as e:
+        raise HTTPException(502, f'Cloud part upload failed: {e}')
+    except Exception as e:
+        raise HTTPException(502, f'Cloud part upload failed: {e}')
 
 @app.post('/upload/complete')
 def upload_complete(body: UploadComplete, background_tasks: BackgroundTasks):
     require_storage()
-    if body.size > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(413, 'Video exceeds upload limit')
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    if body.size <= 0 or body.size > max_bytes:
+        raise HTTPException(413, 'Invalid video size')
+    expected = (body.size + PART_SIZE - 1) // PART_SIZE
     parts = sorted(body.parts, key=lambda p: int(p.get('PartNumber', 0)))
-    if not parts or [int(p.get('PartNumber',0)) for p in parts] != list(range(1, len(parts)+1)):
-        raise HTTPException(409, 'Uploaded parts are incomplete or out of order')
+    numbers = [int(p.get('PartNumber', 0)) for p in parts]
+    if numbers != list(range(1, expected + 1)):
+        raise HTTPException(409, f'All {expected} upload parts are required')
+    if any(not p.get('ETag') for p in parts):
+        raise HTTPException(409, 'Every upload part must have an ETag')
     try:
         s3.complete_multipart_upload(Bucket=R2_BUCKET, Key=body.key, UploadId=body.upload_id, MultipartUpload={'Parts':[{'PartNumber':int(p['PartNumber']),'ETag':p['ETag']} for p in parts]})
+        meta = s3.head_object(Bucket=R2_BUCKET, Key=body.key)
+        if int(meta.get('ContentLength', -1)) != body.size:
+            raise RuntimeError(f'Persistent object size mismatch: {meta.get("ContentLength")} != {body.size}')
         job_id = str(uuid.uuid4()); job_dir = WORK_DIR / job_id; job_dir.mkdir(parents=True, exist_ok=True); video = job_dir / 'source.mp4'
         with video.open('wb') as out:
             s3.download_fileobj(R2_BUCKET, body.key, out)
         if video.stat().st_size != body.size:
-            raise RuntimeError(f'Persistent object size mismatch: {video.stat().st_size} != {body.size}')
+            raise RuntimeError('Downloaded source size does not match uploaded size')
         JOBS[job_id] = {'status':'queued','progress':0,'clips':[],'instruction':body.instruction,'storage_key':body.key}
         max_clips = max(1, min(int(body.max_clips), 10))
         background_tasks.add_task(legacy.pipeline, job_id, video, None, max_clips, body.instruction)
-        return {'job_id':job_id,'status':'queued','version':'5.0.0'}
+        return {'job_id':job_id,'status':'queued','version':'5.1.0'}
     except ClientError as e:
         raise HTTPException(502, f'Persistent upload completion failed: {e}')
     except Exception as e:
@@ -124,12 +144,6 @@ def upload_abort(key: str, upload_id: str):
     except Exception as e:
         raise HTTPException(400, f'Could not abort upload: {e}')
 
-@app.post('/process')
-async def process_proxy(background_tasks: BackgroundTasks, x_api_key: Optional[str] = Header(None), **kwargs):
-    # Legacy endpoint remains available for compatibility; the production UI uses R2 multipart upload.
-    check_auth(x_api_key)
-    raise HTTPException(410, 'Direct /process upload is disabled in V5. Use the persistent multipart uploader.')
-
 @app.get('/status/{job_id}')
 def status(job_id: str):
     if job_id not in JOBS: raise HTTPException(404, 'job not found')
@@ -139,4 +153,4 @@ def status(job_id: str):
 def download(job_id: str, clip_index: int):
     path = WORK_DIR / job_id / f'clip_{clip_index}.mp4'
     if not path.exists(): raise HTTPException(404, 'clip not found')
-    return legacy.FileResponse(path, media_type='video/mp4', filename=path.name)
+    return FileResponse(path, media_type='video/mp4', filename=path.name)
