@@ -2,7 +2,7 @@ import os
 import shutil
 import uuid
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 UPLOAD_ROOT = Path(os.getenv("WORK_DIR", "./jobs")) / "_uploads"
@@ -22,18 +22,29 @@ async def init_upload(request: Request):
     folder = UPLOAD_ROOT / upload_id
     folder.mkdir(parents=True)
     (folder / "meta.txt").write_text(f"{filename}\n{size}\n", encoding="utf-8")
-    return {"upload_id": upload_id, "chunk_size": 8 * 1024 * 1024}
+    return {"upload_id": upload_id, "chunk_size": 4 * 1024 * 1024}
 
-@router.put("/chunk/{upload_id}/{chunk_index}")
-async def upload_chunk(upload_id: str, chunk_index: int, request: Request):
+@router.post("/chunk/{upload_id}/{chunk_index}")
+async def upload_chunk(upload_id: str, chunk_index: int, chunk: UploadFile = File(...)):
     folder = UPLOAD_ROOT / upload_id
     if not folder.exists() or chunk_index < 0:
         raise HTTPException(404, "Upload session not found")
     path = folder / f"chunk_{chunk_index:06d}"
-    with path.open("wb") as out:
-        async for part in request.stream():
-            out.write(part)
-    return {"ok": True, "chunk": chunk_index}
+    written = 0
+    try:
+        with path.open("wb") as out:
+            while True:
+                part = await chunk.read(1024 * 1024)
+                if not part:
+                    break
+                out.write(part)
+                written += len(part)
+    except Exception as exc:
+        path.unlink(missing_ok=True)
+        raise HTTPException(500, f"Chunk upload failed: {exc}")
+    finally:
+        await chunk.close()
+    return {"ok": True, "chunk": chunk_index, "bytes": written}
 
 @router.post("/complete/{upload_id}")
 async def complete_upload(upload_id: str, request: Request):
