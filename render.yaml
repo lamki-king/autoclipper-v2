@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: autoclipper-v2
+    runtime: docker
+    repo: https://github.com/lamki-king/autoclipper-v2
+    plan: free
+    region: oregon
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    autoDeployTrigger: commit
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_TEXT_MODEL
+        value: gpt-5.6-luna
+      - key: OPENAI_TRANSCRIBE_MODEL
+        value: whisper-1
+      - key: MAX_UPLOAD_MB
+        value: "500"
