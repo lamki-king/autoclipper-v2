@@ -15,12 +15,12 @@ from pydantic import BaseModel
 WORK_DIR = Path(os.getenv("WORK_DIR", "./jobs"))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5.6-luna")
+TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini")
 TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-app = FastAPI(title="AutoClipper V2", version="2.0.0")
+app = FastAPI(title="AutoClipper V2", version="2.0.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 JOBS: dict[str, dict] = {}
 
@@ -37,11 +37,11 @@ def run_cmd(cmd: list[str]) -> None:
 
 def transcribe(video_path: Path, job_dir: Path) -> dict:
     if not client:
-        raise RuntimeError("OPENAI_API_KEY is not configured")
+        raise RuntimeError("OPENAI_API_KEY is not configured in Render")
     audio = job_dir / "audio.mp3"
     run_cmd(["ffmpeg", "-y", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", str(audio)])
     if audio.stat().st_size > 24 * 1024 * 1024:
-        raise RuntimeError("Audio is too large for the transcription request. Use a shorter video.")
+        raise RuntimeError("Audio is too large for transcription. Use a shorter video.")
     with audio.open("rb") as f:
         result = client.audio.transcriptions.create(model=TRANSCRIBE_MODEL, file=f, response_format="verbose_json", timestamp_granularities=["segment"])
     segments = [{"start": float(s.start), "end": float(s.end), "text": s.text} for s in (getattr(result, "segments", []) or [])]
@@ -51,7 +51,7 @@ def transcribe(video_path: Path, job_dir: Path) -> dict:
 
 def find_highlights(transcript: dict, max_clips: int) -> list[ClipSegment]:
     if not client:
-        raise RuntimeError("OPENAI_API_KEY is not configured")
+        raise RuntimeError("OPENAI_API_KEY is not configured in Render")
     lines = [f"[{s['start']:.1f}-{s['end']:.1f}] {s['text'].strip()}" for s in transcript["segments"]]
     prompt = f"""You select viral short-form moments from a timestamped transcript. Return exactly {max_clips} or fewer clips. Each must be 15-45 seconds, must stay inside the transcript, and should have a strong hook, punchline, emotion, useful insight, conflict, surprise, or high-energy moment. Return ONLY JSON in this shape: {{\"clips\":[{{\"start\":12.3,\"end\":35.2,\"title\":\"short title\",\"reason\":\"why it works\"}}]}}\n\nTRANSCRIPT:\n{chr(10).join(lines)}"""
     response = client.responses.create(model=TEXT_MODEL, input=prompt)
@@ -74,7 +74,8 @@ def build_ass(transcript: dict, start: float, end: float, path: Path) -> None:
     header = """[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, Bold, Outline, Shadow, Alignment, MarginV\nStyle: Default,DejaVu Sans,64,&H00FFFFFF,&H00000000,1,4,1,2,160\n\n[Events]\nFormat: Layer, Start, End, Style, Text\n"""
     events = []
     for seg in transcript["segments"]:
-        if seg["end"] < start or seg["start"] > end: continue
+        if seg["end"] < start or seg["start"] > end:
+            continue
         a = max(0.0, seg["start"] - start); b = min(end - start, seg["end"] - start)
         text = seg["text"].strip().replace("{", "\\{").replace("}", "\\}").replace(",", "\\,")
         events.append(f"Dialogue: 0,{ass_time(a)},{ass_time(b)},Default,{text}")
@@ -107,12 +108,17 @@ def root():
     if ui.exists(): return HTMLResponse(ui.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>AutoClipper V2</h1><p>Frontend not found.</p>", status_code=500)
 
+@app.head("/")
+def root_head():
+    return HTMLResponse("")
+
 @app.get("/health")
-def health(): return {"status": "healthy", "openai_configured": bool(OPENAI_API_KEY)}
+def health():
+    return {"status": "healthy", "openai_configured": bool(OPENAI_API_KEY), "text_model": TEXT_MODEL, "transcribe_model": TRANSCRIBE_MODEL}
 
 @app.post("/process")
 async def process_video(background_tasks: BackgroundTasks, file: UploadFile = File(...), watermark: Optional[UploadFile] = File(None), max_clips: int = 5):
-    if not client: raise HTTPException(503, "OPENAI_API_KEY is not configured")
+    if not client: raise HTTPException(503, "OPENAI_API_KEY is not configured in Render")
     if not file.filename: raise HTTPException(400, "A video file is required")
     max_clips = max(1, min(max_clips, 10)); job_id = str(uuid.uuid4()); job_dir = WORK_DIR / job_id; job_dir.mkdir(parents=True, exist_ok=True)
     video = job_dir / "source.mp4"
