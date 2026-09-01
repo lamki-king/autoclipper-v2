@@ -17,4 +17,4 @@ services:
       - key: OPENAI_TRANSCRIBE_MODEL
         value: whisper-1
       - key: MAX_UPLOAD_MB
-        value: "500"
+        value: "1240"
