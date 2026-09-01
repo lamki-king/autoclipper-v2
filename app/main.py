@@ -1,4 +1,5 @@
 import json, os, shutil, subprocess, uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
@@ -9,8 +10,9 @@ from pydantic import BaseModel
 
 WORK_DIR=Path(os.getenv('WORK_DIR','./jobs')); WORK_DIR.mkdir(parents=True,exist_ok=True)
 OPENAI_API_KEY=os.getenv('OPENAI_API_KEY',''); TEXT_MODEL=os.getenv('OPENAI_TEXT_MODEL','gpt-4o-mini'); TRANSCRIBE_MODEL=os.getenv('OPENAI_TRANSCRIBE_MODEL','whisper-1'); MAX_UPLOAD_MB=int(os.getenv('MAX_UPLOAD_MB','500'))
+RENDER_WORKERS=max(1,min(int(os.getenv('AUTOCLIPPER_RENDER_WORKERS','2')),4))
 client=OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-app=FastAPI(title='AutoClipper V3',version='3.0.0'); app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_methods=['*'],allow_headers=['*']); JOBS={}
+app=FastAPI(title='AutoClipper V3',version='3.1.0'); app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_methods=['*'],allow_headers=['*']); JOBS={}
 
 class ClipSegment(BaseModel):
     start:float; end:float; title:str; reason:str; hook:str; category:str; score:int; scores:dict
@@ -46,8 +48,7 @@ TRANSCRIPT:\n{lines}'''
     if not clips: raise RuntimeError('AI did not return valid clip segments')
     return clips
 
-def ass_time(s):
-    return f"{int(s//3600)}:{int(s%3600//60):02d}:{s%60:05.2f}"
+def ass_time(s): return f"{int(s//3600)}:{int(s%3600//60):02d}:{s%60:05.2f}"
 
 def build_ass(transcript,start,end,path):
     h='''[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, Bold, Outline, Shadow, Alignment, MarginV\nStyle: Default,DejaVu Sans,64,&H00FFFFFF,&H00000000,1,4,1,2,160\n\n[Events]\nFormat: Layer, Start, End, Style, Text\n'''; events=[]
@@ -59,9 +60,11 @@ def build_ass(transcript,start,end,path):
 def render_clip(source,transcript,clip,out,watermark):
     ass=out.with_suffix('.ass'); build_ass(transcript,clip.start,clip.end,ass); dur=clip.end-clip.start; af=f'ass={ass.as_posix()}'
     if watermark and watermark.exists():
-        cmd=['ffmpeg','-y','-ss',str(clip.start),'-t',str(dur),'-i',str(source),'-i',str(watermark),'-filter_complex',f'[0:v]crop=ih*9/16:ih,scale=1080:1920[c];[1:v]scale=220:-1[wm];[c][wm]overlay=W-w-30:30,{af}[v]','-map','[v]','-map','0:a?','-c:v','libx264','-preset','fast','-crf','20','-c:a','aac','-b:a','160k',str(out)]
-    else: cmd=['ffmpeg','-y','-ss',str(clip.start),'-t',str(dur),'-i',str(source),'-vf',f'crop=ih*9/16:ih,scale=1080:1920,{af}','-map','0:v','-map','0:a?','-c:v','libx264','-preset','fast','-crf','20','-c:a','aac','-b:a','160k',str(out)]
-    run_cmd(cmd)
+        fc=f'[0:v]crop=ih*9/16:ih,scale=1080:1920[c];[1:v]scale=220:-1[wm];[c][wm]overlay=W-w-30:30,{af}[v]'
+        cmd=['ffmpeg','-y','-ss',str(clip.start),'-t',str(dur),'-i',str(source),'-i',str(watermark),'-filter_complex',fc,'-map','[v]','-map','0:a?','-c:v','libx264','-preset','veryfast','-crf','21','-threads','0','-c:a','aac','-b:a','160k','-movflags','+faststart',str(out)]
+    else:
+        cmd=['ffmpeg','-y','-ss',str(clip.start),'-t',str(dur),'-i',str(source),'-vf',f'crop=ih*9/16:ih,scale=1080:1920,{af}','-map','0:v','-map','0:a?','-c:v','libx264','-preset','veryfast','-crf','21','-threads','0','-c:a','aac','-b:a','160k','-movflags','+faststart',str(out)]
+    run_cmd(cmd); ass.unlink(missing_ok=True)
 
 def social_package(clips,instruction):
     if not client: return {}
@@ -71,14 +74,21 @@ def social_package(clips,instruction):
         return json.loads(r.output_text.strip().replace('```json','').replace('```','').strip())
     except Exception: return {}
 
+def render_one(args):
+    job_id,video,transcript,clip,i,wm=args; out=video.parent/f'clip_{i}.mp4'; render_clip(video,transcript,clip,out,wm); return {'index':i,**clip.model_dump(),'download_url':f'/download/{job_id}/{i}'}
+
 def pipeline(job_id,video,watermark,max_clips,instruction):
     try:
-        JOBS[job_id]['status']='transcribing'; transcript=transcribe(video,video.parent)
-        JOBS[job_id]['status']='scoring_highlights'; clips=find_highlights(transcript,max_clips,instruction)
-        JOBS[job_id]['status']='rendering'; results=[]
-        for i,c in enumerate(clips):
-            out=video.parent/f'clip_{i}.mp4'; render_clip(video,transcript,c,out,watermark); results.append({'index':i,**c.model_dump(),'download_url':f'/download/{job_id}/{i}'})
-        JOBS[job_id]['status']='creating_social_package'; JOBS[job_id].update(status='done',clips=results,social=social_package(clips,instruction))
+        JOBS[job_id]['status']='transcribing'; JOBS[job_id]['progress']=10; transcript=transcribe(video,video.parent)
+        JOBS[job_id]['status']='scoring_highlights'; JOBS[job_id]['progress']=35; clips=find_highlights(transcript,max_clips,instruction)
+        JOBS[job_id].update(status='rendering',progress=40,total_clips=len(clips),completed_clips=0,render_workers=RENDER_WORKERS)
+        args=[(job_id,video,transcript,c,i,watermark) for i,c in enumerate(clips)]
+        results=[None]*len(args)
+        with ThreadPoolExecutor(max_workers=min(RENDER_WORKERS,len(args))) as pool:
+            futures={pool.submit(render_one,a):i for i,a in enumerate(args)}
+            for n,f in enumerate(futures):
+                i=futures[f]; results[i]=f.result(); JOBS[job_id]['completed_clips']=n+1; JOBS[job_id]['progress']=40+int((n+1)/len(args)*50)
+        JOBS[job_id]['status']='creating_social_package'; JOBS[job_id]['progress']=95; JOBS[job_id].update(status='done',progress=100,clips=results,social=social_package(clips,instruction))
     except Exception as e: JOBS[job_id].update(status='failed',error=str(e))
 
 @app.get('/',response_class=HTMLResponse)
@@ -88,7 +98,7 @@ def root():
 @app.head('/')
 def root_head(): return HTMLResponse('')
 @app.get('/health')
-def health(): return {'status':'healthy','version':'3.0.0','openai_configured':bool(OPENAI_API_KEY),'text_model':TEXT_MODEL,'transcribe_model':TRANSCRIBE_MODEL}
+def health(): return {'status':'healthy','version':'3.1.0','openai_configured':bool(OPENAI_API_KEY),'text_model':TEXT_MODEL,'transcribe_model':TRANSCRIBE_MODEL,'render_workers':RENDER_WORKERS}
 @app.post('/process')
 async def process_video(background_tasks:BackgroundTasks,file:UploadFile=File(...),watermark:Optional[UploadFile]=File(None),max_clips:int=5,instruction:str=''):
     if not client: raise HTTPException(503,'OPENAI_API_KEY is not configured in Render')
@@ -100,7 +110,7 @@ async def process_video(background_tasks:BackgroundTasks,file:UploadFile=File(..
     if watermark:
         wm=job_dir/'watermark.png'
         with wm.open('wb') as out: shutil.copyfileobj(watermark.file,out)
-    JOBS[job_id]={'status':'queued','clips':[],'instruction':instruction}; background_tasks.add_task(pipeline,job_id,video,wm,max_clips,instruction); return {'job_id':job_id,'status':'queued','version':'3.0.0'}
+    JOBS[job_id]={'status':'queued','progress':0,'clips':[],'instruction':instruction}; background_tasks.add_task(pipeline,job_id,video,wm,max_clips,instruction); return {'job_id':job_id,'status':'queued','version':'3.1.0'}
 @app.get('/status/{job_id}')
 def status(job_id:str):
     if job_id not in JOBS: raise HTTPException(404,'job not found')
