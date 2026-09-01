@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+env/
+jobs/
+*.mp4
+*.mp3
+*.wav
+*.ass
+.env
+.DS_Store
