@@ -8,11 +8,12 @@ services:
     dockerContext: .
     dockerfilePath: ./Dockerfile
     autoDeployTrigger: commit
+    healthCheckPath: /health
     envVars:
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_TEXT_MODEL
-        value: gpt-5.6-luna
+        value: gpt-4o-mini
       - key: OPENAI_TRANSCRIBE_MODEL
         value: whisper-1
       - key: MAX_UPLOAD_MB
