@@ -5,6 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
+COPY frontend/ ./frontend/
 ENV OPENAI_TEXT_MODEL=gpt-5.6-luna
 ENV OPENAI_TRANSCRIBE_MODEL=whisper-1
 EXPOSE 8000
