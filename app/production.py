@@ -77,6 +77,20 @@ def upload_init(body: UploadInit):
         return {'upload_id':created['UploadId'],'key':key,'part_size':PART_SIZE,'total_parts':(body.size + PART_SIZE - 1)//PART_SIZE,'status':'initialized'}
     except Exception as e: raise HTTPException(502, f'Could not initialize persistent upload: {e}')
 
+@app.put('/upload/raw-part/{upload_id}/{part_number}')
+async def upload_raw_part(upload_id: str, part_number: int, key: str, request: Request):
+    require_storage()
+    if part_number < 1 or part_number > 10000: raise HTTPException(400, 'Invalid part number')
+    if not key.startswith('uploads/'): raise HTTPException(400, 'Invalid upload key')
+    try:
+        body = await request.body()
+        if not body or len(body) > PART_SIZE + 1024 * 1024: raise HTTPException(413, 'Invalid chunk size')
+        result = s3.upload_part(Bucket=R2_BUCKET, Key=key, UploadId=upload_id, PartNumber=part_number, Body=body)
+        return {'PartNumber':part_number,'ETag':result['ETag']}
+    except HTTPException: raise
+    except ClientError as e: raise HTTPException(502, f'Cloud part upload failed: {e}')
+    except Exception as e: raise HTTPException(502, f'Cloud part upload failed: {e}')
+
 @app.put('/upload/part/{upload_id}/{part_number}')
 async def upload_part(upload_id: str, part_number: int, key: str, chunk: UploadFile = File(...)):
     require_storage()
