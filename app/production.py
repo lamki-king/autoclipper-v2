@@ -186,7 +186,9 @@ async def process_raw(request: Request, filename: str = 'source.mp4', source_url
 @app.get('/status/{job_id}')
 def status(job_id: str):
     if job_id not in JOBS: raise HTTPException(404, 'job not found')
-    return JOBS[job_id]
+    data = dict(JOBS[job_id])
+    data['job_id'] = job_id
+    return data
 
 @app.get('/download/{job_id}/{clip_index}')
 def download(job_id: str, clip_index: int):
