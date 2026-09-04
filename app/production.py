@@ -144,6 +144,45 @@ def upload_abort(key: str, upload_id: str):
     except Exception as e:
         raise HTTPException(400, f'Could not abort upload: {e}')
 
+@app.post('/process-raw')
+async def process_raw(request: Request, filename: str = 'source.mp4', max_clips: int = 5, instruction: str = '', x_api_key: Optional[str] = Header(None)):
+    check_auth(x_api_key)
+    cleanup_old_jobs()
+    if not client:
+        raise HTTPException(503, 'OPENAI_API_KEY is not configured in Render')
+    max_clips = max(1, min(int(max_clips), 10))
+    safe_name = Path(filename).name or 'source.mp4'
+    job_id = str(uuid.uuid4())
+    job_dir = WORK_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    video = job_dir / 'source.mp4'
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    size = 0
+    try:
+        with video.open('wb') as out:
+            async for chunk in request.stream():
+                if chunk:
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise HTTPException(413, f'Video exceeds {MAX_UPLOAD_MB} MB')
+                    out.write(chunk)
+    except HTTPException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, f'Failed to save raw video upload: {e}')
+    if size <= 0:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, 'Empty video upload')
+    JOBS[job_id] = {'status':'queued','progress':0,'clips':[],'instruction':instruction,'source_filename':safe_name}
+    background_tasks = BackgroundTasks()
+    background_tasks.add_task(pipeline, job_id, video, None, max_clips, instruction)
+    from fastapi.responses import JSONResponse
+    response = JSONResponse({'job_id':job_id,'status':'queued','version':app.version})
+    response.background = background_tasks
+    return response
+
 @app.get('/status/{job_id}')
 def status(job_id: str):
     if job_id not in JOBS: raise HTTPException(404, 'job not found')
