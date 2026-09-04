@@ -23,8 +23,9 @@ def download_youtube(url: str, output: Path):
     cmd = [
         'yt-dlp',
         '--no-playlist',
+        '--js-runtimes', 'deno',
         '--merge-output-format', 'mp4',
-        '-f', 'bv*[height<=1080]+ba/b[height<=1080]',
+        '-f', 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b[height<=1080]',
         '-o', str(output),
         url,
     ]
