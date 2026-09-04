@@ -1,11 +1,10 @@
 import os
-import shutil
 import subprocess
 import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException
 
 from app import production
 
@@ -18,25 +17,41 @@ def check_auth(x_api_key: Optional[str]):
         raise HTTPException(401, 'Invalid or missing X-API-Key')
 
 
+def _run_ytdlp(args, output: Path):
+    cmd = ['yt-dlp', '--no-playlist', '--no-warnings', '--retries', '2', '--fragment-retries', '2', '--retry-sleep', '2', '--merge-output-format', 'mp4', *args, '-o', str(output)]
+    result = subprocess.run(cmd, text=True, capture_output=True, timeout=1800)
+    if result.returncode == 0 and output.exists() and output.stat().st_size > 0:
+        return
+    raise RuntimeError(result.stderr[-4000:] or result.stdout[-4000:] or 'yt-dlp failed')
+
+
 def download_youtube(url: str, output: Path):
     output.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        'yt-dlp',
-        '--no-playlist',
-        '--js-runtimes', 'deno',
-        '--merge-output-format', 'mp4',
-        '-f', 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b[height<=1080]',
-        '-o', str(output),
-        url,
+    attempts = [
+        [
+            '--js-runtimes', 'deno',
+            '-f', 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b[height<=1080]',
+            url,
+        ],
+        [
+            '--extractor-args', 'youtube:player_client=android_vr',
+            '-f', '18',
+            url,
+        ],
     ]
-    try:
-        result = subprocess.run(cmd, text=True, capture_output=True, timeout=1800)
-    except FileNotFoundError:
-        raise RuntimeError('yt-dlp is not installed')
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr[-4000:] or 'yt-dlp failed')
-    if not output.exists() or output.stat().st_size == 0:
-        raise RuntimeError('yt-dlp completed without producing a video file')
+    errors = []
+    for args in attempts:
+        try:
+            _run_ytdlp(args, output)
+            return
+        except Exception as exc:
+            errors.append(str(exc))
+            if output.exists():
+                try:
+                    output.unlink()
+                except Exception:
+                    pass
+    raise RuntimeError('YouTube download failed after all supported extraction profiles: ' + ' | '.join(errors)[-7000:])
 
 
 def run_youtube_job(job_id: str, url: str, max_clips: int, instruction: str):
