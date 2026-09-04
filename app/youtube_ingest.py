@@ -22,22 +22,16 @@ def _run_ytdlp(args, output: Path):
     result = subprocess.run(cmd, text=True, capture_output=True, timeout=1800)
     if result.returncode == 0 and output.exists() and output.stat().st_size > 0:
         return
-    raise RuntimeError(result.stderr[-4000:] or result.stdout[-4000:] or 'yt-dlp failed')
+    raise RuntimeError(result.stderr[-5000:] or result.stdout[-5000:] or 'yt-dlp failed')
 
 
 def download_youtube(url: str, output: Path):
     output.parent.mkdir(parents=True, exist_ok=True)
     attempts = [
-        [
-            '--js-runtimes', 'deno',
-            '-f', 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/b[height<=1080]',
-            url,
-        ],
-        [
-            '--extractor-args', 'youtube:player_client=android_vr',
-            '-f', '18',
-            url,
-        ],
+        ['--remote-components', 'ejs:github', '--impersonate', 'chrome', '--extractor-args', 'youtube:player_client=web_embedded,web_safari,web_creator,mweb', '-f', 'bv*[height<=1080]+ba/b[height<=1080]', url],
+        ['--remote-components', 'ejs:github', '--impersonate', 'chrome', '--extractor-args', 'youtube:player_client=web,web_embedded', '-f', 'bv*[height<=1080]+ba/b[height<=1080]', url],
+        ['--js-runtimes', 'deno', '--remote-components', 'ejs:github', '--extractor-args', 'youtube:player_client=tv', '-f', 'b[height<=720]/18', url],
+        ['--extractor-args', 'youtube:player_client=android_vr', '-f', '18', url],
     ]
     errors = []
     for args in attempts:
@@ -51,7 +45,7 @@ def download_youtube(url: str, output: Path):
                     output.unlink()
                 except Exception:
                     pass
-    raise RuntimeError('YouTube download failed after all supported extraction profiles: ' + ' | '.join(errors)[-7000:])
+    raise RuntimeError('YouTube download failed after all supported extraction profiles: ' + ' | '.join(errors)[-9000:])
 
 
 def run_youtube_job(job_id: str, url: str, max_clips: int, instruction: str):
