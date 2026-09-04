@@ -14,6 +14,11 @@ OPENAI_API_KEY=os.getenv('OPENAI_API_KEY',''); TEXT_MODEL=os.getenv('OPENAI_TEXT
 RENDER_WORKERS=max(1,min(int(os.getenv('AUTOCLIPPER_RENDER_WORKERS','2')),4)); ENCODER=os.getenv('AUTOCLIPPER_ENCODER','auto'); API_KEY=os.getenv('AUTOCLIPPER_API_KEY',''); JOB_TTL_HOURS=int(os.getenv('JOB_TTL_HOURS','24')); UPLOAD_TTL_HOURS=int(os.getenv('UPLOAD_TTL_HOURS','6'))
 from app.job_store import PersistentJobs
 
+app = FastAPI(title='AutoClipper V5', version='5.2.0')
+app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+JOBS = PersistentJobs()
+
 class ClipSegment(BaseModel):
     start:float; end:float; title:str; reason:str; hook:str; category:str; score:int; scores:dict
 class UploadInit(BaseModel):
