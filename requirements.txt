@@ -3,5 +3,5 @@ uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 openai>=1.109.0,<2
 pydantic==2.9.2
-boto3>=1.35,<2
 yt-dlp[default]>=2026.8.19,<2027
+psycopg2-binary>=2.9,<3

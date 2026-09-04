@@ -14,46 +14,8 @@ UPLOAD_DIR=Path(os.getenv('UPLOAD_DIR',str(WORK_DIR/'_uploads'))); UPLOAD_DIR.mk
 CHUNK_SIZE=max(1024*1024,min(int(os.getenv('UPLOAD_CHUNK_MB','4'))*1024*1024,16*1024*1024))
 OPENAI_API_KEY=os.getenv('OPENAI_API_KEY',''); TEXT_MODEL=os.getenv('OPENAI_TEXT_MODEL','gpt-4o-mini'); TRANSCRIBE_MODEL=os.getenv('OPENAI_TRANSCRIBE_MODEL','whisper-1'); MAX_UPLOAD_MB=int(os.getenv('MAX_UPLOAD_MB','500'))
 RENDER_WORKERS=max(1,min(int(os.getenv('AUTOCLIPPER_RENDER_WORKERS','2')),4)); ENCODER=os.getenv('AUTOCLIPPER_ENCODER','auto'); API_KEY=os.getenv('AUTOCLIPPER_API_KEY',''); JOB_TTL_HOURS=int(os.getenv('JOB_TTL_HOURS','24')); UPLOAD_TTL_HOURS=int(os.getenv('UPLOAD_TTL_HOURS','6'))
-R2_ACCOUNT_ID=os.getenv('R2_ACCOUNT_ID',''); R2_ACCESS_KEY_ID=os.getenv('R2_ACCESS_KEY_ID',''); R2_SECRET_ACCESS_KEY=os.getenv('R2_SECRET_ACCESS_KEY',''); R2_BUCKET=os.getenv('R2_BUCKET',''); R2_ENDPOINT=os.getenv('R2_ENDPOINT') or (f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com' if R2_ACCOUNT_ID else '')
-_r2_jobs=boto3.client('s3',endpoint_url=R2_ENDPOINT,aws_access_key_id=R2_ACCESS_KEY_ID,aws_secret_access_key=R2_SECRET_ACCESS_KEY,region_name='auto') if all([R2_ACCOUNT_ID,R2_ACCESS_KEY_ID,R2_SECRET_ACCESS_KEY,R2_BUCKET,R2_ENDPOINT]) else None
-client=OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-app=FastAPI(title='AutoClipper V5',version='5.2.0'); app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_methods=['*'],allow_headers=['*'])
+from app.job_store import PersistentJobs
 
-def _job_key(job_id): return f'jobs/{job_id}.json'
-def _load_job(job_id):
-    if not _r2_jobs: return None
-    try:
-        return json.loads(_r2_jobs.get_object(Bucket=R2_BUCKET,Key=_job_key(job_id))['Body'].read().decode('utf-8'))
-    except Exception: return None
-def _save_job(job_id,value):
-    if not _r2_jobs: return
-    try: _r2_jobs.put_object(Bucket=R2_BUCKET,Key=_job_key(job_id),Body=json.dumps(dict(value),separators=(',',':')).encode(),ContentType='application/json')
-    except Exception: pass
-def _delete_job(job_id):
-    if not _r2_jobs: return
-    try: _r2_jobs.delete_object(Bucket=R2_BUCKET,Key=_job_key(job_id))
-    except Exception: pass
-class PersistentJob(dict):
-    def __init__(self,job_id,*args,**kwargs): self._job_id=job_id; super().__init__(*args,**kwargs)
-    def __setitem__(self,k,v): super().__setitem__(k,v); _save_job(self._job_id,self)
-    def update(self,*args,**kwargs): super().update(*args,**kwargs); _save_job(self._job_id,self)
-class PersistentJobs(dict):
-    def _hydrate(self,job_id):
-        if dict.__contains__(self,job_id): return dict.__getitem__(self,job_id)
-        data=_load_job(job_id)
-        if data is not None:
-            job=PersistentJob(job_id,data); dict.__setitem__(self,job_id,job); return job
-        return None
-    def __contains__(self,job_id): return self._hydrate(job_id) is not None
-    def __getitem__(self,job_id):
-        job=self._hydrate(job_id)
-        if job is None: raise KeyError(job_id)
-        return job
-    def __setitem__(self,job_id,value):
-        job=PersistentJob(job_id,value); dict.__setitem__(self,job_id,job); _save_job(job_id,job)
-    def pop(self,job_id,*args):
-        result=dict.pop(self,job_id,*args); _delete_job(job_id); return result
-JOBS=PersistentJobs()
 class ClipSegment(BaseModel):
     start:float; end:float; title:str; reason:str; hook:str; category:str; score:int; scores:dict
 class UploadInit(BaseModel):

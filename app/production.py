@@ -2,8 +2,6 @@ import importlib.util, os, shutil, uuid
 from pathlib import Path
 from typing import Optional
 
-import boto3
-from botocore.exceptions import ClientError
 from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -15,16 +13,7 @@ _spec.loader.exec_module(legacy)
 
 WORK_DIR = Path(os.getenv('WORK_DIR', './jobs')); WORK_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_MB = int(os.getenv('MAX_UPLOAD_MB', '500'))
-PART_SIZE = max(5 * 1024 * 1024, int(os.getenv('R2_PART_SIZE_MB', '8')) * 1024 * 1024)
-R2_ACCOUNT_ID = os.getenv('R2_ACCOUNT_ID', '')
-R2_ACCESS_KEY_ID = os.getenv('R2_ACCESS_KEY_ID', '')
-R2_SECRET_ACCESS_KEY = os.getenv('R2_SECRET_ACCESS_KEY', '')
-R2_BUCKET = os.getenv('R2_BUCKET', '')
-R2_ENDPOINT = os.getenv('R2_ENDPOINT') or (f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com' if R2_ACCOUNT_ID else '')
-
-s3 = None
-if all([R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_ENDPOINT]):
-    s3 = boto3.client('s3', endpoint_url=R2_ENDPOINT, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, region_name='auto')
+PART_SIZE = max(5 * 1024 * 1024, int(os.getenv('UPLOAD_PART_SIZE_MB', '8')) * 1024 * 1024)
 
 JOBS = legacy.JOBS
 legacy.WORK_DIR = WORK_DIR
@@ -64,73 +53,81 @@ def root_head(): return HTMLResponse('')
 
 @app.get('/health')
 def health():
-    return {'status':'healthy','version':'5.1.0','openai_configured':bool(os.getenv('OPENAI_API_KEY')),'storage':'r2' if s3 else 'not_configured','part_size':PART_SIZE,'max_upload_mb':MAX_UPLOAD_MB,'encoder':legacy.VIDEO_ENCODER}
+    return {'status':'healthy','version':'5.1.0','openai_configured':bool(os.getenv('OPENAI_API_KEY')),'storage':'local_uploads','part_size':PART_SIZE,'max_upload_mb':MAX_UPLOAD_MB,'encoder':legacy.VIDEO_ENCODER}
 
 @app.post('/upload/init')
 def upload_init(body: UploadInit):
-    require_storage()
-    if not body.filename or body.size <= 0: raise HTTPException(400, 'A valid filename and size are required')
-    if body.size > MAX_UPLOAD_MB * 1024 * 1024: raise HTTPException(413, f'Video exceeds {MAX_UPLOAD_MB} MB')
-    key = f'uploads/{uuid.uuid4().hex}/{Path(body.filename).name}'
-    try:
-        created = s3.create_multipart_upload(Bucket=R2_BUCKET, Key=key, ContentType=body.content_type or 'video/mp4')
-        return {'upload_id':created['UploadId'],'key':key,'part_size':PART_SIZE,'total_parts':(body.size + PART_SIZE - 1)//PART_SIZE,'status':'initialized'}
-    except Exception as e: raise HTTPException(502, f'Could not initialize persistent upload: {e}')
+    if not body.filename or body.size <= 0:
+        raise HTTPException(400, 'A valid filename and size are required')
+    if body.size > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(413, f'Video exceeds {MAX_UPLOAD_MB} MB')
+    upload_id = uuid.uuid4().hex
+    directory = WORK_DIR / '_uploads' / upload_id
+    directory.mkdir(parents=True, exist_ok=False)
+    meta = {'filename': Path(body.filename).name, 'size': body.size, 'content_type': body.content_type or 'video/mp4'}
+    (directory / 'meta.json').write_text(json.dumps(meta), encoding='utf-8')
+    return {'upload_id': upload_id, 'key': f'uploads/{upload_id}/{meta["filename"]}', 'part_size': PART_SIZE, 'total_parts': (body.size + PART_SIZE - 1) // PART_SIZE, 'status': 'initialized'}
 
 @app.put('/upload/raw-part/{upload_id}/{part_number}')
 async def upload_raw_part(upload_id: str, part_number: int, key: str, request: Request):
-    require_storage()
-    if part_number < 1 or part_number > 10000: raise HTTPException(400, 'Invalid part number')
-    if not key.startswith('uploads/'): raise HTTPException(400, 'Invalid upload key')
-    try:
-        body = await request.body()
-        if not body or len(body) > PART_SIZE + 1024 * 1024: raise HTTPException(413, 'Invalid chunk size')
-        result = s3.upload_part(Bucket=R2_BUCKET, Key=key, UploadId=upload_id, PartNumber=part_number, Body=body)
-        return {'PartNumber':part_number,'ETag':result['ETag']}
-    except HTTPException: raise
-    except ClientError as e: raise HTTPException(502, f'Cloud part upload failed: {e}')
-    except Exception as e: raise HTTPException(502, f'Cloud part upload failed: {e}')
-
-@app.put('/upload/part/{upload_id}/{part_number}')
-async def upload_part(upload_id: str, part_number: int, key: str, chunk: UploadFile = File(...)):
-    require_storage()
-    if part_number < 1 or part_number > 10000: raise HTTPException(400, 'Invalid part number')
-    if not key.startswith('uploads/'): raise HTTPException(400, 'Invalid upload key')
-    try:
-        body = await chunk.read()
-        if not body or len(body) > PART_SIZE + 1024 * 1024: raise HTTPException(413, 'Invalid chunk size')
-        result = s3.upload_part(Bucket=R2_BUCKET, Key=key, UploadId=upload_id, PartNumber=part_number, Body=body)
-        return {'PartNumber':part_number,'ETag':result['ETag']}
-    except HTTPException: raise
-    except ClientError as e: raise HTTPException(502, f'Cloud part upload failed: {e}')
-    except Exception as e: raise HTTPException(502, f'Cloud part upload failed: {e}')
+    if part_number < 1 or part_number > 10000:
+        raise HTTPException(400, 'Invalid part number')
+    directory = WORK_DIR / '_uploads' / upload_id
+    if not directory.is_dir() or not key.startswith(f'uploads/{upload_id}/'):
+        raise HTTPException(404, 'Upload session not found')
+    body = await request.body()
+    if not body or len(body) > PART_SIZE + 1024 * 1024:
+        raise HTTPException(413, 'Invalid chunk size')
+    part = directory / f'{part_number:08d}.part'
+    part.write_bytes(body)
+    import hashlib
+    etag = hashlib.md5(body).hexdigest()
+    return {'PartNumber': part_number, 'ETag': etag, 'upload_id': upload_id, 'received': len(body)}
 
 @app.post('/upload/complete')
 def upload_complete(body: UploadComplete, background_tasks: BackgroundTasks):
-    require_storage(); max_bytes = MAX_UPLOAD_MB * 1024 * 1024
-    if body.size <= 0 or body.size > max_bytes: raise HTTPException(413, 'Invalid video size')
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    if body.size <= 0 or body.size > max_bytes:
+        raise HTTPException(413, 'Invalid video size')
+    directory = WORK_DIR / '_uploads' / body.upload_id
+    meta_path = directory / 'meta.json'
+    if not directory.is_dir() or not meta_path.exists():
+        raise HTTPException(404, 'Upload session not found')
     expected = (body.size + PART_SIZE - 1) // PART_SIZE
-    parts = sorted(body.parts, key=lambda p: int(p.get('PartNumber', 0))); numbers = [int(p.get('PartNumber', 0)) for p in parts]
-    if numbers != list(range(1, expected + 1)): raise HTTPException(409, f'All {expected} upload parts are required')
-    if any(not p.get('ETag') for p in parts): raise HTTPException(409, 'Every upload part must have an ETag')
+    parts = sorted(body.parts, key=lambda p: int(p.get('PartNumber', 0)))
+    numbers = [int(p.get('PartNumber', 0)) for p in parts]
+    if numbers != list(range(1, expected + 1)):
+        raise HTTPException(409, f'All {expected} upload parts are required')
+    job_id = str(uuid.uuid4())
+    job_dir = WORK_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    video = job_dir / 'source.mp4'
     try:
-        s3.complete_multipart_upload(Bucket=R2_BUCKET, Key=body.key, UploadId=body.upload_id, MultipartUpload={'Parts':[{'PartNumber':int(p['PartNumber']),'ETag':p['ETag']} for p in parts]})
-        meta = s3.head_object(Bucket=R2_BUCKET, Key=body.key)
-        if int(meta.get('ContentLength', -1)) != body.size: raise RuntimeError(f'Persistent object size mismatch: {meta.get("ContentLength")} != {body.size}')
-        job_id = str(uuid.uuid4()); job_dir = WORK_DIR / job_id; job_dir.mkdir(parents=True, exist_ok=True); video = job_dir / 'source.mp4'
-        with video.open('wb') as out: s3.download_fileobj(R2_BUCKET, body.key, out)
-        if video.stat().st_size != body.size: raise RuntimeError('Downloaded source size does not match uploaded size')
-        JOBS[job_id] = {'status':'queued','progress':0,'clips':[],'instruction':body.instruction,'storage_key':body.key}
-        max_clips = max(1, min(int(body.max_clips), 10)); background_tasks.add_task(legacy.pipeline, job_id, video, None, max_clips, body.instruction)
-        return {'job_id':job_id,'status':'queued','version':'5.1.0'}
-    except ClientError as e: raise HTTPException(502, f'Persistent upload completion failed: {e}')
-    except Exception as e: raise HTTPException(400, f'Failed to start processing: {e}')
+        with video.open('wb') as out:
+            for n in numbers:
+                part = directory / f'{n:08d}.part'
+                if not part.exists():
+                    raise HTTPException(409, f'Missing upload part {n}')
+                with part.open('rb') as src:
+                    shutil.copyfileobj(src, out, length=1024 * 1024)
+        if video.stat().st_size != body.size:
+            raise RuntimeError(f'Upload size mismatch: {video.stat().st_size} != {body.size}')
+        max_clips = max(1, min(int(body.max_clips), 10))
+        JOBS[job_id] = {'status': 'queued', 'progress': 0, 'clips': [], 'instruction': body.instruction, 'storage_key': body.key}
+        background_tasks.add_task(legacy.pipeline, job_id, video, None, max_clips, body.instruction)
+        shutil.rmtree(directory, ignore_errors=True)
+        return {'job_id': job_id, 'status': 'queued', 'version': app.version}
+    except HTTPException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, f'Failed to start processing: {e}')
 
 @app.post('/upload/abort')
 def upload_abort(key: str, upload_id: str):
-    require_storage()
-    try: s3.abort_multipart_upload(Bucket=R2_BUCKET, Key=key, UploadId=upload_id); return {'status':'aborted'}
-    except Exception as e: raise HTTPException(400, f'Could not abort upload: {e}')
+    shutil.rmtree(WORK_DIR / '_uploads' / upload_id, ignore_errors=True)
+    return {'status': 'aborted'}
 
 @app.post('/process-raw')
 async def process_raw(request: Request, filename: str = 'source.mp4', source_url: str = '', max_clips: int = 5, instruction: str = '', x_api_key: Optional[str] = Header(None)):
