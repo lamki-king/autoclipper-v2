@@ -1,5 +1,4 @@
 import json, os, shutil, subprocess, time, uuid, threading
-import boto3
 from botocore.exceptions import ClientError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
