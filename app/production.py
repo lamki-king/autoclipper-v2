@@ -145,7 +145,7 @@ def upload_abort(key: str, upload_id: str):
         raise HTTPException(400, f'Could not abort upload: {e}')
 
 @app.post('/process-raw')
-async def process_raw(request: Request, filename: str = 'source.mp4', max_clips: int = 5, instruction: str = '', x_api_key: Optional[str] = Header(None)):
+async def process_raw(request: Request, filename: str = 'source.mp4', source_url: str = '', max_clips: int = 5, instruction: str = '', x_api_key: Optional[str] = Header(None)):
     check_auth(x_api_key)
     cleanup_old_jobs()
     if not client:
@@ -175,7 +175,7 @@ async def process_raw(request: Request, filename: str = 'source.mp4', max_clips:
     if size <= 0:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(400, 'Empty video upload')
-    JOBS[job_id] = {'status':'queued','progress':0,'clips':[],'instruction':instruction,'source_filename':safe_name}
+    JOBS[job_id] = {'status':'queued','progress':0,'clips':[],'instruction':instruction,'source_url':source_url,'source_filename':safe_name,'max_clips':max_clips}
     background_tasks = BackgroundTasks()
     background_tasks.add_task(pipeline, job_id, video, None, max_clips, instruction)
     from fastapi.responses import JSONResponse
