@@ -6,17 +6,19 @@ from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, Uploa
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from google import genai
+from openai import OpenAI
 from pydantic import BaseModel
 WORK_DIR=Path(os.getenv('WORK_DIR','./jobs')); WORK_DIR.mkdir(parents=True,exist_ok=True)
 UPLOAD_DIR=Path(os.getenv('UPLOAD_DIR',str(WORK_DIR/'_uploads'))); UPLOAD_DIR.mkdir(parents=True,exist_ok=True)
 CHUNK_SIZE=max(1024*1024,min(int(os.getenv('UPLOAD_CHUNK_MB','4'))*1024*1024,16*1024*1024))
-GEMINI_API_KEY=os.getenv('GEMINI_API_KEY',''); GEMINI_MODEL=os.getenv('GEMINI_MODEL','gemini-3.7-flash'); TRANSCRIBE_MODEL=os.getenv('TRANSCRIBE_MODEL','tiny'); MAX_UPLOAD_MB=int(os.getenv('MAX_UPLOAD_MB','500'))
+GEMINI_API_KEY=os.getenv('GEMINI_API_KEY',''); GEMINI_MODEL=os.getenv('GEMINI_MODEL','gemini-3.7-flash'); OPENAI_API_KEY=os.getenv('OPENAI_API_KEY',''); OPENAI_TEXT_MODEL=os.getenv('OPENAI_TEXT_MODEL','gpt-4o-mini'); TRANSCRIBE_MODEL=os.getenv('TRANSCRIBE_MODEL','tiny'); MAX_UPLOAD_MB=int(os.getenv('MAX_UPLOAD_MB','500'))
 RENDER_WORKERS=max(1,min(int(os.getenv('AUTOCLIPPER_RENDER_WORKERS','2')),4)); ENCODER=os.getenv('AUTOCLIPPER_ENCODER','auto'); API_KEY=os.getenv('AUTOCLIPPER_API_KEY',''); JOB_TTL_HOURS=int(os.getenv('JOB_TTL_HOURS','24')); UPLOAD_TTL_HOURS=int(os.getenv('UPLOAD_TTL_HOURS','6'))
 from app.job_store import PersistentJobs
 
 app = FastAPI(title='AutoClipper V5', version='5.2.0')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 JOBS = PersistentJobs()
 
 class ClipSegment(BaseModel):
@@ -65,11 +67,15 @@ def transcribe(video_path,job_dir):
     if not segs: raise RuntimeError('No speech segments were returned')
     return {'text':' '.join(s['text'] for s in segs),'segments':segs}
 def _gemini_text(prompt):
-    if not client: raise RuntimeError('GEMINI_API_KEY is not configured in Render')
-    r=client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-    text=(getattr(r,'text',None) or '').strip()
-    if not text: raise RuntimeError('Gemini returned an empty response')
-    return text.replace('```json','').replace('```','').strip()
+    if client:
+        r=client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        text=(getattr(r,'text',None) or '').strip()
+        if text: return text.replace('```json','').replace('```','').strip()
+    if openai_client:
+        r=openai_client.chat.completions.create(model=OPENAI_TEXT_MODEL, messages=[{'role':'user','content':prompt}], temperature=0)
+        text=(r.choices[0].message.content or '').strip()
+        if text: return text.replace('```json','').replace('```','').strip()
+    raise RuntimeError('No AI text provider is configured in Render')
 
 def find_highlights(transcript,max_clips,instruction=''):
     lines='\n'.join(f"[{s['start']:.1f}-{s['end']:.1f}] {s['text']}" for s in transcript['segments'])
@@ -135,7 +141,7 @@ def root():
 @app.head('/')
 def root_head(): return HTMLResponse('')
 @app.get('/health')
-def health(): return {'status':'healthy','version':'4.1.1','gemini_configured':bool(GEMINI_API_KEY),'gemini_model':GEMINI_MODEL,'transcribe_model':TRANSCRIBE_MODEL,'render_workers':RENDER_WORKERS,'encoder':VIDEO_ENCODER,'chunk_size':CHUNK_SIZE,'auth_required':bool(API_KEY)}
+def health(): return {'status':'healthy','version':'4.1.1','gemini_configured':bool(GEMINI_API_KEY),'gemini_model':GEMINI_MODEL,'openai_configured':bool(OPENAI_API_KEY),'openai_text_model':OPENAI_TEXT_MODEL,'transcribe_model':TRANSCRIBE_MODEL,'render_workers':RENDER_WORKERS,'encoder':VIDEO_ENCODER,'chunk_size':CHUNK_SIZE,'auth_required':bool(API_KEY)}
 @app.post('/upload/init')
 def upload_init(body:UploadInit):
     cleanup_old_uploads()
@@ -188,7 +194,7 @@ def upload_complete(upload_id:str,body:UploadComplete,background_tasks:Backgroun
 @app.post('/process')
 async def process_video(background_tasks:BackgroundTasks,file:UploadFile=File(...),watermark:Optional[UploadFile]=File(None),max_clips:int=5,instruction:str='',x_api_key:Optional[str]=Header(None)):
     check_auth(x_api_key); cleanup_old_jobs()
-    if not client: raise HTTPException(503,'GEMINI_API_KEY is not configured in Render')
+    if not client and not openai_client: raise HTTPException(503,'No AI text provider is configured in Render')
     if not file.filename: raise HTTPException(400,'A video file is required')
     max_clips=max(1,min(max_clips,10)); job_id=str(uuid.uuid4()); job_dir=WORK_DIR/job_id; job_dir.mkdir(parents=True,exist_ok=True); video=job_dir/'source.mp4'; max_bytes=MAX_UPLOAD_MB*1024*1024; size=0
     try:
