@@ -25,4 +25,6 @@ ENV MAX_UPLOAD_MB=500
 ENV PATH="/usr/local/bin:${PATH}"
 
 EXPOSE 8000
-CMD ["uvicorn", "app.entry:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# Start the bgutil HTTP PO-token server beside FastAPI.
+CMD ["sh", "-c", "cd /opt/bgutil-ytdlp-pot-provider/server/node_modules && deno run --no-prompt --allow-env --allow-net --allow-ffi=. --allow-read=. ../src/main.ts --port 4416 & exec uvicorn app.entry:app --host 0.0.0.0 --port 8000"]

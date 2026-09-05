@@ -35,21 +35,22 @@ def download_youtube(url: str, output: Path):
         [
             '--remote-components', 'ejs:github',
             '--js-runtimes', 'deno',
-            '--extractor-args', 'youtube:player_client=mweb,web_safari,web_embedded,tv',
-            '--extractor-args', 'youtubepot-bgutilscript:server_home=/opt/bgutil-ytdlp-pot-provider/server',
+            '--extractor-args', 'youtube:player_client=mweb,web_safari,web_embedded,tv_embedded,default',
+            '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
             '-f', 'bv*[height<=1080]+ba/b[height<=1080]', url,
         ],
         [
             '--remote-components', 'ejs:github',
             '--js-runtimes', 'deno',
-            '--extractor-args', 'youtube:player_client=web_safari,web_embedded,tv',
-            '--extractor-args', 'youtubepot-bgutilscript:server_home=/opt/bgutil-ytdlp-pot-provider/server',
+            '--extractor-args', 'youtube:player_client=mweb,web_safari,web_embedded,default',
+            '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
             '-f', 'bv*[height<=1080]+ba/b[height<=1080]', url,
         ],
         [
             '--remote-components', 'ejs:github',
             '--js-runtimes', 'deno',
-            '--extractor-args', 'youtube:player_client=web_embedded,tv',
+            '--extractor-args', 'youtube:player_client=mweb,default',
+            '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
             '-f', 'b[height<=720]/18', url,
         ],
         [
