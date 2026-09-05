@@ -18,7 +18,11 @@ def check_auth(x_api_key: Optional[str]):
 
 
 def _run_ytdlp(args, output: Path):
-    cmd = ['yt-dlp', '--no-playlist', '--no-warnings', '--retries', '2', '--fragment-retries', '2', '--retry-sleep', '2', '--merge-output-format', 'mp4', *args, '-o', str(output)]
+    cmd = [
+        'yt-dlp', '--no-playlist', '--no-warnings',
+        '--retries', '3', '--fragment-retries', '3', '--retry-sleep', '3',
+        '--merge-output-format', 'mp4', *args, '-o', str(output)
+    ]
     result = subprocess.run(cmd, text=True, capture_output=True, timeout=1800)
     if result.returncode == 0 and output.exists() and output.stat().st_size > 0:
         return
@@ -28,10 +32,30 @@ def _run_ytdlp(args, output: Path):
 def download_youtube(url: str, output: Path):
     output.parent.mkdir(parents=True, exist_ok=True)
     attempts = [
-        ['--remote-components', 'ejs:github', '--impersonate', 'chrome', '--extractor-args', 'youtube:player_client=web_embedded,web_safari,web_creator,mweb', '-f', 'bv*[height<=1080]+ba/b[height<=1080]', url],
-        ['--remote-components', 'ejs:github', '--impersonate', 'chrome', '--extractor-args', 'youtube:player_client=web,web_embedded', '-f', 'bv*[height<=1080]+ba/b[height<=1080]', url],
-        ['--js-runtimes', 'deno', '--remote-components', 'ejs:github', '--extractor-args', 'youtube:player_client=tv', '-f', 'b[height<=720]/18', url],
-        ['--extractor-args', 'youtube:player_client=android_vr', '-f', '18', url],
+        [
+            '--remote-components', 'ejs:github',
+            '--js-runtimes', 'deno',
+            '--extractor-args', 'youtube:player_client=mweb,web_safari,web_embedded,tv',
+            '--extractor-args', 'youtubepot-bgutilscript:server_home=/opt/bgutil-ytdlp-pot-provider/server',
+            '-f', 'bv*[height<=1080]+ba/b[height<=1080]', url,
+        ],
+        [
+            '--remote-components', 'ejs:github',
+            '--js-runtimes', 'deno',
+            '--extractor-args', 'youtube:player_client=web_safari,web_embedded,tv',
+            '--extractor-args', 'youtubepot-bgutilscript:server_home=/opt/bgutil-ytdlp-pot-provider/server',
+            '-f', 'bv*[height<=1080]+ba/b[height<=1080]', url,
+        ],
+        [
+            '--remote-components', 'ejs:github',
+            '--js-runtimes', 'deno',
+            '--extractor-args', 'youtube:player_client=web_embedded,tv',
+            '-f', 'b[height<=720]/18', url,
+        ],
+        [
+            '--extractor-args', 'youtube:player_client=tv',
+            '-f', 'b[height<=720]/18', url,
+        ],
     ]
     errors = []
     for args in attempts:
@@ -82,12 +106,8 @@ def process_youtube(
     max_clips = max(1, min(int(max_clips), 10))
     job_id = str(uuid.uuid4())
     production.JOBS[job_id] = {
-        'status': 'queued',
-        'progress': 0,
-        'clips': [],
-        'instruction': instruction,
-        'source_url': url,
-        'max_clips': max_clips,
+        'status': 'queued', 'progress': 0, 'clips': [],
+        'instruction': instruction, 'source_url': url, 'max_clips': max_clips,
     }
     background_tasks.add_task(run_youtube_job, job_id, url, max_clips, instruction)
     return {'job_id': job_id, 'status': 'queued', 'version': production.app.version}
