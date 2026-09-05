@@ -1,4 +1,5 @@
 import json
+import urllib.request
 import importlib.util, os, shutil, uuid
 from pathlib import Path
 from typing import Optional
@@ -151,6 +152,50 @@ async def process_raw(request: Request, filename: str = 'source.mp4', source_url
     JOBS[job_id] = {'status':'queued','progress':0,'clips':[],'instruction':instruction,'source_url':source_url,'source_filename':safe_name,'max_clips':max_clips}
     background_tasks = BackgroundTasks(); background_tasks.add_task(legacy.pipeline, job_id, video, None, max_clips, instruction)
     response = JSONResponse({'job_id':job_id,'status':'queued','version':app.version}); response.background = background_tasks; return response
+
+@app.post('/process-remote')
+async def process_remote(body: dict, background_tasks: BackgroundTasks, x_api_key: Optional[str] = Header(None)):
+    check_auth(x_api_key); legacy.cleanup_old_jobs()
+    if not legacy.client:
+        raise HTTPException(503, 'OPENAI_API_KEY is not configured in Render')
+    source_url = str(body.get('url') or '').strip()
+    if not source_url:
+        raise HTTPException(400, 'A Dropbox temporary URL is required')
+    max_clips = max(1, min(int(body.get('max_clips', 5)), 10))
+    instruction = str(body.get('instruction') or '')
+    filename = Path(str(body.get('filename') or 'source.mp4')).name or 'source.mp4'
+    job_id = str(uuid.uuid4())
+    job_dir = WORK_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    video = job_dir / 'source.mp4'
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    size = 0
+    try:
+        req = urllib.request.Request(source_url, headers={'User-Agent': 'AutoClipper/5.2'})
+        with urllib.request.urlopen(req, timeout=60) as src, video.open('wb') as out:
+            length = src.headers.get('Content-Length')
+            if length and int(length) > max_bytes:
+                raise HTTPException(413, f'Video exceeds {MAX_UPLOAD_MB} MB')
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise HTTPException(413, f'Video exceeds {MAX_UPLOAD_MB} MB')
+                out.write(chunk)
+    except HTTPException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, f'Failed to fetch remote video: {e}')
+    if size <= 0:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, 'Remote video was empty')
+    JOBS[job_id] = {'status':'queued','progress':0,'clips':[],'instruction':instruction,'source_url':str(body.get('source_url') or source_url),'source_filename':filename,'max_clips':max_clips}
+    background_tasks.add_task(legacy.pipeline, job_id, video, None, max_clips, instruction)
+    return {'job_id':job_id,'status':'queued','version':app.version,'source_filename':filename,'size':size}
 
 @app.get('/status/{job_id}')
 def status(job_id: str):
