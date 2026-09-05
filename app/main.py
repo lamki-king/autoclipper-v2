@@ -5,18 +5,18 @@ from typing import Optional
 from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
-from openai import OpenAI
+from google import genai
 from pydantic import BaseModel
 WORK_DIR=Path(os.getenv('WORK_DIR','./jobs')); WORK_DIR.mkdir(parents=True,exist_ok=True)
 UPLOAD_DIR=Path(os.getenv('UPLOAD_DIR',str(WORK_DIR/'_uploads'))); UPLOAD_DIR.mkdir(parents=True,exist_ok=True)
 CHUNK_SIZE=max(1024*1024,min(int(os.getenv('UPLOAD_CHUNK_MB','4'))*1024*1024,16*1024*1024))
-OPENAI_API_KEY=os.getenv('OPENAI_API_KEY',''); TEXT_MODEL=os.getenv('OPENAI_TEXT_MODEL','gpt-4o-mini'); TRANSCRIBE_MODEL=os.getenv('OPENAI_TRANSCRIBE_MODEL','whisper-1'); MAX_UPLOAD_MB=int(os.getenv('MAX_UPLOAD_MB','500'))
+GEMINI_API_KEY=os.getenv('GEMINI_API_KEY',''); GEMINI_MODEL=os.getenv('GEMINI_MODEL','gemini-3.7-flash'); TRANSCRIBE_MODEL=os.getenv('TRANSCRIBE_MODEL','tiny'); MAX_UPLOAD_MB=int(os.getenv('MAX_UPLOAD_MB','500'))
 RENDER_WORKERS=max(1,min(int(os.getenv('AUTOCLIPPER_RENDER_WORKERS','2')),4)); ENCODER=os.getenv('AUTOCLIPPER_ENCODER','auto'); API_KEY=os.getenv('AUTOCLIPPER_API_KEY',''); JOB_TTL_HOURS=int(os.getenv('JOB_TTL_HOURS','24')); UPLOAD_TTL_HOURS=int(os.getenv('UPLOAD_TTL_HOURS','6'))
 from app.job_store import PersistentJobs
 
 app = FastAPI(title='AutoClipper V5', version='5.2.0')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 JOBS = PersistentJobs()
 
 class ClipSegment(BaseModel):
@@ -50,30 +50,46 @@ def cleanup_old_uploads():
             if d.is_dir() and d.stat().st_mtime<cutoff: shutil.rmtree(d,ignore_errors=True)
         except Exception: pass
 def transcribe(video_path,job_dir):
-    if not client: raise RuntimeError('OPENAI_API_KEY is not configured in Render')
-    audio=job_dir/'audio.mp3'; run_cmd(['ffmpeg','-y','-threads','0','-i',str(video_path),'-vn','-ac','1','-ar','16000','-b:a','24k',str(audio)])
-    if audio.stat().st_size>24*1024*1024: raise RuntimeError('Audio is too large for transcription. Use a shorter video.')
-    with audio.open('rb') as f: result=client.audio.transcriptions.create(model=TRANSCRIBE_MODEL,file=f,response_format='verbose_json',timestamp_granularities=['segment'])
-    segs=[{'start':float(s.start),'end':float(s.end),'text':s.text.strip()} for s in (getattr(result,'segments',[]) or [])]
+    audio=job_dir/'audio.wav'
+    run_cmd(['ffmpeg','-y','-threads','0','-i',str(video_path),'-vn','-ac','1','-ar','16000','-c:a','pcm_s16le',str(audio)])
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as e:
+        raise RuntimeError(f'Local transcription engine unavailable: {e}')
+    model=WhisperModel(TRANSCRIBE_MODEL, device='cpu', compute_type='int8')
+    segments,_=model.transcribe(str(audio), beam_size=1, vad_filter=True, word_timestamps=False)
+    segs=[]
+    for s in segments:
+        text=str(s.text or '').strip()
+        if text: segs.append({'start':float(s.start),'end':float(s.end),'text':text})
     if not segs: raise RuntimeError('No speech segments were returned')
-    return {'text':getattr(result,'text',''),'segments':segs}
+    return {'text':' '.join(s['text'] for s in segs),'segments':segs}
+def _gemini_text(prompt):
+    if not client: raise RuntimeError('GEMINI_API_KEY is not configured in Render')
+    r=client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    text=(getattr(r,'text',None) or '').strip()
+    if not text: raise RuntimeError('Gemini returned an empty response')
+    return text.replace('```json','').replace('```','').strip()
+
 def find_highlights(transcript,max_clips,instruction=''):
-    if not client: raise RuntimeError('OPENAI_API_KEY is not configured in Render')
     lines='\n'.join(f"[{s['start']:.1f}-{s['end']:.1f}] {s['text']}" for s in transcript['segments'])
-    prompt=f'''You are AutoClipper's elite short-form editorial engine. Select up to {max_clips} distinct, standalone moments. Creator instruction: {instruction.strip() or 'Find the strongest viral moments.'}
-Rules: 15-60 seconds; never cut mid-thought; start on the hook or necessary setup and end after payoff; favor surprise, emotion, humor, conflict, useful advice, memorable quotes and high information density; reject greetings, weak setup, repetition and context-dependent fragments; avoid overlapping clips unless the moments are genuinely distinct. Optimize for retention and comprehension, not just sensationalism. Score 0-99 for hook, flow, value, emotion, shareability and clarity. category: story, insight, controversy, humor, emotion, tutorial, reaction, motivation, news, other. hook is a short headline and must not fabricate a quote. Return ONLY JSON: {{"clips":[{{"start":12.3,"end":38.5,"title":"Short title","reason":"Why it works","hook":"Scroll-stopping headline","category":"insight","score":94,"scores":{{"hook":96,"flow":92,"value":95,"emotion":88,"shareability":94,"clarity":96}}}}]}}
-TRANSCRIPT:\n{lines}'''
-    r=client.chat.completions.create(model=TEXT_MODEL,messages=[{'role':'user','content':prompt}],response_format={'type':'json_object'}); raw=(r.choices[0].message.content or '').strip().replace('```json','').replace('```','').strip(); data=json.loads(raw); clips=[]
+    prompt=f'''You are AutoClipper's elite short-form editorial engine. Select up to {max_clips} distinct, standalone moments from the COMPLETE transcript. Creator instruction: {instruction.strip() or 'Find the strongest viral moments.'}
+Rules: 15-60 seconds; never cut mid-thought; start on the hook or necessary setup and end after payoff; favor surprise, emotion, humor, conflict, useful advice, memorable quotes and high information density; reject greetings, weak setup, repetition and context-dependent fragments; avoid overlapping clips unless genuinely distinct. Score 0-99 for hook, flow, value, emotion, shareability and clarity. Return ONLY valid JSON with a clips array. Use the supplied timestamps exactly and never invent spoken content.
+TRANSCRIPT:
+{lines}'''
+    raw=_gemini_text(prompt)
+    data=json.loads(raw); clips=[]
     for x in data.get('clips',[])[:max_clips]:
         try: start,end=float(x['start']),float(x['end'])
         except Exception: continue
         if not(end>start and 15<=end-start<=60): continue
-        scores={k:max(0,min(99,int(v))) for k,v in dict(x.get('scores',{})).items() if k in {'hook','flow','value','emotion','shareability','clarity'}}; score=max(0,min(99,int(x.get('score',0)))) or (round(sum(scores.values())/len(scores)) if scores else 0)
+        scores={k:max(0,min(99,int(v))) for k,v in dict(x.get('scores',{})).items() if k in {'hook','flow','value','emotion','shareability','clarity'}}
+        score=max(0,min(99,int(x.get('score',0)))) or (round(sum(scores.values())/len(scores)) if scores else 0)
         clips.append(ClipSegment(start=start,end=end,title=str(x.get('title','Untitled clip')),reason=str(x.get('reason','Strong short-form moment.')),hook=str(x.get('hook',x.get('title',''))),category=str(x.get('category','other')),score=score,scores=scores))
     clips.sort(key=lambda c:c.score,reverse=True); selected=[]
     for c in clips:
         if all(c.end<=p.start+2 or c.start>=p.end-2 for p in selected): selected.append(c)
-    if not selected: raise RuntimeError('AI did not return valid distinct clip segments')
+    if not selected: raise RuntimeError('Gemini did not return valid distinct clip segments')
     return selected
 def ass_time(s): return f"{int(s//3600)}:{int(s%3600//60):02d}:{s%60:05.2f}"
 def build_ass(transcript,start,end,path):
@@ -94,7 +110,8 @@ def social_package(clips,instruction):
     if not client: return {}
     brief='\n'.join(f'{i+1}. {c.title} | {c.hook} | {c.category} | {c.score}' for i,c in enumerate(clips))
     try:
-        r=client.chat.completions.create(model=TEXT_MODEL,messages=[{'role':'user','content':f'''Create concise social metadata for these clips. Instruction: {instruction or 'maximize clarity and shareability'}. Return ONLY JSON with keys youtube_shorts,tiktok,instagram. Each value has title,caption,hashtags(array). Do not invent facts.\n{brief}'''}],response_format={'type':'json_object'}); raw=(r.choices[0].message.content or '').strip().replace('```json','').replace('```','').strip(); return json.loads(raw)
+        raw=_gemini_text(f'''Create concise social metadata for these clips. Instruction: {instruction or 'maximize clarity and shareability'}. Return ONLY JSON with keys youtube_shorts,tiktok,instagram. Each value has title,caption,hashtags(array). Do not invent facts.\n{brief}''')
+        return json.loads(raw)
     except Exception: return {}
 def render_one(args):
     job_id,video,transcript,clip,i,wm=args; out=video.parent/f'clip_{i}.mp4'; render_clip(video,transcript,clip,out,wm); return {'index':i,**clip.model_dump(),'download_url':f'/download/{job_id}/{i}'}
@@ -118,7 +135,7 @@ def root():
 @app.head('/')
 def root_head(): return HTMLResponse('')
 @app.get('/health')
-def health(): return {'status':'healthy','version':'4.1.1','openai_configured':bool(OPENAI_API_KEY),'text_model':TEXT_MODEL,'transcribe_model':TRANSCRIBE_MODEL,'render_workers':RENDER_WORKERS,'encoder':VIDEO_ENCODER,'chunk_size':CHUNK_SIZE,'auth_required':bool(API_KEY)}
+def health(): return {'status':'healthy','version':'4.1.1','gemini_configured':bool(GEMINI_API_KEY),'gemini_model':GEMINI_MODEL,'transcribe_model':TRANSCRIBE_MODEL,'render_workers':RENDER_WORKERS,'encoder':VIDEO_ENCODER,'chunk_size':CHUNK_SIZE,'auth_required':bool(API_KEY)}
 @app.post('/upload/init')
 def upload_init(body:UploadInit):
     cleanup_old_uploads()
@@ -171,7 +188,7 @@ def upload_complete(upload_id:str,body:UploadComplete,background_tasks:Backgroun
 @app.post('/process')
 async def process_video(background_tasks:BackgroundTasks,file:UploadFile=File(...),watermark:Optional[UploadFile]=File(None),max_clips:int=5,instruction:str='',x_api_key:Optional[str]=Header(None)):
     check_auth(x_api_key); cleanup_old_jobs()
-    if not client: raise HTTPException(503,'OPENAI_API_KEY is not configured in Render')
+    if not client: raise HTTPException(503,'GEMINI_API_KEY is not configured in Render')
     if not file.filename: raise HTTPException(400,'A video file is required')
     max_clips=max(1,min(max_clips,10)); job_id=str(uuid.uuid4()); job_dir=WORK_DIR/job_id; job_dir.mkdir(parents=True,exist_ok=True); video=job_dir/'source.mp4'; max_bytes=MAX_UPLOAD_MB*1024*1024; size=0
     try:

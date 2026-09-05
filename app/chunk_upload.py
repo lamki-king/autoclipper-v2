@@ -80,7 +80,7 @@ async def complete_upload(upload_id: str, request: Request):
     from app.main import JOBS, pipeline, client
     if not client:
         shutil.rmtree(job_dir, ignore_errors=True)
-        raise HTTPException(503, "OPENAI_API_KEY is not configured in Render")
+        raise HTTPException(503, "GEMINI_API_KEY is not configured in Render")
     max_clips = max(1, min(int(data.get("max_clips") or 5), 10))
     instruction = str(data.get("instruction") or "")
     JOBS[job_id] = {"status": "queued", "progress": 0, "clips": [], "instruction": instruction}

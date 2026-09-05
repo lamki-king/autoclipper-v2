@@ -55,7 +55,7 @@ def root_head(): return HTMLResponse('')
 
 @app.get('/health')
 def health():
-    return {'status':'healthy','version':'5.1.0','openai_configured':bool(os.getenv('OPENAI_API_KEY')),'storage':'local_uploads','part_size':PART_SIZE,'max_upload_mb':MAX_UPLOAD_MB,'encoder':legacy.VIDEO_ENCODER}
+    return {'status':'healthy','version':'5.1.0','gemini_configured':bool(os.getenv('GEMINI_API_KEY')),'storage':'local_uploads','part_size':PART_SIZE,'max_upload_mb':MAX_UPLOAD_MB,'encoder':legacy.VIDEO_ENCODER}
 
 @app.post('/upload/init')
 def upload_init(body: UploadInit):
@@ -134,7 +134,7 @@ def upload_abort(key: str, upload_id: str):
 @app.post('/process-raw')
 async def process_raw(request: Request, filename: str = 'source.mp4', source_url: str = '', max_clips: int = 5, instruction: str = '', x_api_key: Optional[str] = Header(None)):
     check_auth(x_api_key); legacy.cleanup_old_jobs()
-    if not legacy.client: raise HTTPException(503, 'OPENAI_API_KEY is not configured in Render')
+    if not legacy.client: raise HTTPException(503, 'GEMINI_API_KEY is not configured in Render')
     max_clips = max(1, min(int(max_clips), 10)); safe_name = Path(filename).name or 'source.mp4'; job_id = str(uuid.uuid4()); job_dir = WORK_DIR / job_id; job_dir.mkdir(parents=True, exist_ok=True); video = job_dir / 'source.mp4'; max_bytes = MAX_UPLOAD_MB * 1024 * 1024; size = 0
     try:
         with video.open('wb') as out:
@@ -157,7 +157,7 @@ async def process_raw(request: Request, filename: str = 'source.mp4', source_url
 async def process_remote(body: dict, background_tasks: BackgroundTasks, x_api_key: Optional[str] = Header(None)):
     check_auth(x_api_key); legacy.cleanup_old_jobs()
     if not legacy.client:
-        raise HTTPException(503, 'OPENAI_API_KEY is not configured in Render')
+        raise HTTPException(503, 'GEMINI_API_KEY is not configured in Render')
     source_url = str(body.get('url') or '').strip()
     if not source_url:
         raise HTTPException(400, 'A Dropbox temporary URL is required')
