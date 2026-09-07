@@ -31,31 +31,41 @@ def _run_ytdlp(args, output: Path):
 
 def download_youtube(url: str, output: Path):
     output.parent.mkdir(parents=True, exist_ok=True)
+    cookie_file = os.getenv('YOUTUBE_COOKIES_FILE', '').strip()
+    cookie_args = ['--cookies', cookie_file] if cookie_file and Path(cookie_file).is_file() else []
+    common = [
+        '--remote-components', 'ejs:github',
+        '--js-runtimes', 'deno',
+        '--force-ipv4',
+        *cookie_args,
+    ]
     attempts = [
         [
-            '--remote-components', 'ejs:github',
-            '--js-runtimes', 'deno',
-            '--extractor-args', 'youtube:player_client=mweb,web_safari,web_embedded,tv_embedded,default',
-            '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
+            *common,
+            '--extractor-args', 'youtube:player_client=android_vr',
             '-f', 'bv*[height<=1080]+ba/b[height<=1080]', url,
         ],
         [
-            '--remote-components', 'ejs:github',
-            '--js-runtimes', 'deno',
-            '--extractor-args', 'youtube:player_client=mweb,web_safari,web_embedded,default',
-            '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
-            '-f', 'bv*[height<=1080]+ba/b[height<=1080]', url,
-        ],
-        [
-            '--remote-components', 'ejs:github',
-            '--js-runtimes', 'deno',
-            '--extractor-args', 'youtube:player_client=mweb,default',
-            '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
-            '-f', 'b[height<=720]/18', url,
-        ],
-        [
+            *common,
             '--extractor-args', 'youtube:player_client=tv',
             '-f', 'b[height<=720]/18', url,
+        ],
+        [
+            *common,
+            '--extractor-args', 'youtube:player_client=web_embedded',
+            '-f', 'bv*[height<=1080]+ba/b[height<=1080]', url,
+        ],
+        [
+            *common,
+            '--extractor-args', 'youtube:player_client=mweb,default',
+            '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
+            '-f', 'bv*[height<=1080]+ba/b[height<=1080]', url,
+        ],
+        [
+            *common,
+            '--extractor-args', 'youtube:player_client=web_safari,default',
+            '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
+            '-f', 'bv*[height<=1080]+ba/b[height<=1080]', url,
         ],
     ]
     errors = []
